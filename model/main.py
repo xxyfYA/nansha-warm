@@ -61,7 +61,7 @@ CONFIG = {
     "num_fno_layers": 4,
     "fc1_hidden": 256,
 
-    "num_epochs": 200,
+    "num_epochs": 1000,
     "lr": 1e-4,
     "weight_decay": 1e-4,
     "warmup_ratio": 0.05,
