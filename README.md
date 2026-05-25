@@ -270,8 +270,8 @@ lr ▲             █              ██
 │   C_in  = 120               输入特征: 24×3 storm + 24×2 inner               │
 │   C_out = 1                 输出: 单通道 h(t+24)                             │
 │                                                                             │
-│   modes        = 24         傅里叶模态数 (频域保留的低频分量)                  │
-│   width        = 48         隐藏通道维度 (FNO 内部表示)                       │
+│   modes        = 32         傅里叶模态数 (频域保留的低频分量)                  │
+│   width        = 96         隐藏通道维度 (FNO 内部表示)                       │
 │   s1, s2       = 64, 64     规则网格空间分辨率                                │
 │   num_fno_layers = 4        FNO 中间层数 (规则网格上的谱卷积块数)              │
 │   fc1_hidden   = 256        输出投影层隐藏维度                                │
@@ -280,7 +280,7 @@ lr ▲             █              ██
 │   num_workers  = 4          DataLoader 进程数                               │
 │                                                                             │
 │   num_epochs   = 200        总训练轮次                                       │
-│   lr           = 1e-3       峰值学习率 (AdamW)                               │
+│   lr           = 1e-4       峰值学习率 (AdamW)                               │
 │   weight_decay = 1e-4       AdamW 权重衰减                                   │
 │   warmup_ratio = 0.05       LR 线性预热比例 (总步数的 5%)                     │
 │   min_lr_ratio = 0.01       LR 衰减下限 (峰值 lr 的 1%)                      │
@@ -289,7 +289,7 @@ lr ▲             █              ██
 │   loss_type    = "rel_l2"   损失函数: rel_l2 或 rmse                         │
 │   ema_decay    = 0.999      EMA 指数移动平均衰减率                            │
 │                                                                             │
-│   params       ≈ 31.9M      模型总参数量                                      │
+│   params       ≈ 227M       模型总参数量                                      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -332,7 +332,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 coords = load_static_coords("data/coordinates.mat").to(device)
 
-model = GeoFNO2d(modes1=24, modes2=24, width=48,
+model = GeoFNO2d(modes1=32, modes2=32, width=96,
                  in_channels=120, out_channels=1,
                  s1=64, s2=64, num_fno_layers=4, fc1_hidden=256)
 model.load_state_dict(torch.load("best_geofno.pt", map_location=device))
