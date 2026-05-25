@@ -144,7 +144,7 @@ def build_manifest_commands(config: dict) -> list[str]:
 def preflight_manifest_files(config: dict) -> None:
     split_dirs = [
         Path(config[split_key])
-        for split_key in ("train_dir", "val_dir")
+        for split_key in ("train_dir", "val_dir", "test_dir")
     ]
     missing = [
         split_dir / "manifest.json"
