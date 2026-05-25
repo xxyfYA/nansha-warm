@@ -61,7 +61,7 @@ def load_static_coords(coords_path):
     return coords_t
 
 
-def _load_pt(path) -> dict[str, torch.Tensor]:
+def load_pt(path) -> dict[str, torch.Tensor]:
     """Load and validate one storm event .pt file."""
     path = Path(path)
     data = torch.load(path, map_location="cpu", weights_only=False)
@@ -93,20 +93,20 @@ def _load_pt(path) -> dict[str, torch.Tensor]:
     return {"graph": graph, "storm": storm, "inner": inner}
 
 
-def _build_features(
+def build_features(
     storm_window: torch.Tensor,
     inner_window: torch.Tensor,
 ) -> torch.Tensor:
     """Build per-node feature matrix from 24-hour forcing windows.
 
     Args:
-        storm_window: (N, 24, 3) — storm boundary [P, Wx, Wy]
-        inner_window: (N, 24, 2) — inner boundary [h_bdy, q_bdy]
+        storm_window: (T, N, 3) — storm boundary [P, Wx, Wy] where T=24
+        inner_window: (T, N, 2) — inner boundary [h_bdy, q_bdy] where T=24
 
     Returns:
         (N, 120) feature tensor: storm_flat (N, 72) + inner_flat (N, 48)
     """
-    num_nodes = storm_window.size(0)
+    num_nodes = storm_window.size(1)
     storm_flat = storm_window.permute(1, 0, 2).reshape(num_nodes, -1)
     inner_flat = inner_window.permute(1, 0, 2).reshape(num_nodes, -1)
     return torch.cat([storm_flat, inner_flat], dim=-1).contiguous()
@@ -140,7 +140,7 @@ class StormSurgeDataset(Dataset):
         if self.path in self._cache:
             self._cache.move_to_end(self.path)
             return self._cache[self.path]
-        entry = _load_pt(self.path)
+        entry = load_pt(self.path)
         self._cache[self.path] = entry
         while len(self._cache) > self.lru_capacity:
             self._cache.popitem(last=False)
@@ -155,7 +155,7 @@ class StormSurgeDataset(Dataset):
         storm_window = entry["storm"][idx : idx + INPUT_WINDOW]
         inner_window = entry["inner"][idx : idx + INPUT_WINDOW]
         target = graph[idx + INPUT_WINDOW, :, 2:3].contiguous()
-        features = _build_features(storm_window, inner_window)
+        features = build_features(storm_window, inner_window)
         return features, target
 
 
@@ -226,7 +226,7 @@ class MultiStormSurgeDataset(Dataset):
             self._cache.move_to_end(file_idx)
             return self._cache[file_idx]
 
-        entry = _load_pt(self.files[file_idx])
+        entry = load_pt(self.files[file_idx])
         if entry["graph"].size(0) != self.file_T[file_idx]:
             raise ValueError(
                 f"{self.files[file_idx]}: manifest T={self.file_T[file_idx]} "
@@ -253,7 +253,7 @@ class MultiStormSurgeDataset(Dataset):
         storm_window = entry["storm"][t : t + INPUT_WINDOW]
         inner_window = entry["inner"][t : t + INPUT_WINDOW]
         target = graph[t + INPUT_WINDOW, :, 2:3].contiguous()
-        features = _build_features(storm_window, inner_window)
+        features = build_features(storm_window, inner_window)
         return features, target
 
 

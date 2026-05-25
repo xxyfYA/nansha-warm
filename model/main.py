@@ -1,4 +1,4 @@
-"""Training entrypoint for Geo-FNO storm-surge model.
+"""Training entrypoint for Geo-FNO storm-surge warm-up prediction model.
 
 Single GPU:
     python model/main.py
@@ -7,9 +7,9 @@ Single-node multi-GPU DDP:
     torchrun --nproc_per_node=4 model/main.py
 
 Before running, build split manifests explicitly:
-    python scripts/build_manifest.py data/train --bundle_size_warn 8
-    python scripts/build_manifest.py data/val --bundle_size_warn 8
-    python scripts/build_manifest.py data/test --bundle_size_warn 8
+    python scripts/build_manifest.py data/train
+    python scripts/build_manifest.py data/val
+    python scripts/build_manifest.py data/test
 """
 from __future__ import annotations
 
@@ -35,13 +35,7 @@ from dataset import (
 )
 from model import GeoFNO2d
 from scheduler import build_scheduler
-from temporal_utils import (
-    build_checkpoint_name,
-    build_run_suffix,
-    input_channels_for_bundle,
-    output_channels_for_bundle,
-    validate_temporal_params,
-)
+from temporal_utils import C_IN, C_OUT, build_checkpoint_name
 from train import train_model
 
 
@@ -56,14 +50,13 @@ CONFIG = {
 
     "seed": 42,
 
-    "bundle_size": 8,
     "batch_size": 16,
     "num_workers": 4,
     "lru_files_per_worker": 2,
 
     "modes": 24,
     "width": 48,
-    "s1": 64, 
+    "s1": 64,
     "s2": 64,
     "num_fno_layers": 4,
     "fc1_hidden": 256,
@@ -75,7 +68,6 @@ CONFIG = {
     "min_lr_ratio": 0.01,
     "grad_clip": 1.0,
     "accum_steps": 1,
-    "noise_sigma": 0.05,
     "loss_type": "rel_l2",
     "ema_decay": 0.999,
 }
@@ -143,10 +135,8 @@ def rank0_print(dist_ctx: dict, *args, **kwargs):
 
 
 def build_manifest_commands(config: dict) -> list[str]:
-    bundle_size = config["bundle_size"]
     return [
-        f"python scripts/build_manifest.py {config[split_key]} "
-        f"--bundle_size_warn {bundle_size}"
+        f"python scripts/build_manifest.py {config[split_key]}"
         for split_key in ("train_dir", "val_dir", "test_dir")
     ]
 
@@ -181,19 +171,13 @@ def main():
     try:
         if CONFIG["accum_steps"] < 1:
             raise ValueError(f"accum_steps must be >= 1, got {CONFIG['accum_steps']}")
-        validate_temporal_params(CONFIG["bundle_size"])
         preflight_manifest_files(CONFIG)
         set_seed(CONFIG["seed"])
 
-        in_channels = input_channels_for_bundle(CONFIG["bundle_size"])
-        out_channels = output_channels_for_bundle(CONFIG["bundle_size"])
-        checkpoint_name = build_checkpoint_name(CONFIG["bundle_size"])
-        run_tag = (
-            "GeoFNO"
-            + build_run_suffix(CONFIG["bundle_size"])
-            + "_"
-            + datetime.now().strftime("%Y%m%d-%H%M%S")
-        )
+        in_channels = C_IN
+        out_channels = C_OUT
+        checkpoint_name = build_checkpoint_name()
+        run_tag = "GeoFNO_warmup_" + datetime.now().strftime("%Y%m%d-%H%M%S")
 
         device = get_device(dist_ctx)
         rank0_print(
@@ -203,32 +187,24 @@ def main():
         )
         rank0_print(
             dist_ctx,
-            f"[main] bundle_size={CONFIG['bundle_size']}, "
+            f"[main] input_window={in_channels // 5}h, "
             f"in_channels={in_channels}, out_channels={out_channels}",
         )
         rank0_print(dist_ctx, f"[main] checkpoint name: {checkpoint_name}")
 
         rank0_print(dist_ctx, f"[main] loading coords from {CONFIG['coords_path']}")
-        coords_2d_cpu, btype_oh_cpu = load_static_coords(CONFIG["coords_path"])
+        coords_2d_cpu = load_static_coords(CONFIG["coords_path"])
         coords_2d_device = coords_2d_cpu.to(device)
-        rank0_print(
-            dist_ctx,
-            f"[main] coords shape={tuple(coords_2d_cpu.shape)}, "
-            f"btype_oh shape={tuple(btype_oh_cpu.shape)}",
-        )
+        rank0_print(dist_ctx, f"[main] coords shape={tuple(coords_2d_cpu.shape)}")
 
         rank0_print(dist_ctx, f"[main] loading train manifest from {CONFIG['train_dir']}")
         train_dataset = MultiStormSurgeDataset(
             data_dir=CONFIG["train_dir"],
-            bundle_size=CONFIG["bundle_size"],
-            btype_oh=btype_oh_cpu,
             lru_files_per_worker=CONFIG["lru_files_per_worker"],
         )
         rank0_print(dist_ctx, f"[main] loading val manifest from {CONFIG['val_dir']}")
         val_dataset = MultiStormSurgeDataset(
             data_dir=CONFIG["val_dir"],
-            bundle_size=CONFIG["bundle_size"],
-            btype_oh=btype_oh_cpu,
             lru_files_per_worker=CONFIG["lru_files_per_worker"],
         )
         rank0_print(
@@ -331,8 +307,8 @@ def main():
             config_md = "### Training Configuration\n| Parameter | Value |\n|---|---|\n"
             for key, value in CONFIG.items():
                 config_md += f"| {key} | {value} |\n"
-            config_md += f"| in_channels (derived) | {in_channels} |\n"
-            config_md += f"| out_channels (derived) | {out_channels} |\n"
+            config_md += f"| in_channels | {in_channels} |\n"
+            config_md += f"| out_channels | {out_channels} |\n"
             config_md += "\n### System\n| Parameter | Value |\n|---|---|\n"
             config_md += f"| OS | {platform.system()} {platform.release()} |\n"
             config_md += f"| CPU Cores | {os.cpu_count()} |\n"
@@ -360,7 +336,6 @@ def main():
             train_sampler=train_sampler,
             dist_ctx=dist_ctx,
             accum_steps=CONFIG["accum_steps"],
-            noise_sigma=CONFIG["noise_sigma"],
         )
 
         rank0_print(dist_ctx, "[main] done.")

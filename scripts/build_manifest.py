@@ -3,6 +3,7 @@
 
 Usage:
     python scripts/build_manifest.py data/train
+    python scripts/build_manifest.py data/train --min_T_warn 25
     python scripts/build_manifest.py data/test --output data/test/manifest.json
 """
 
@@ -61,7 +62,7 @@ def read_file_metadata(path: Path) -> tuple[int, int]:
     return int(graph.size(0)), int(graph.size(1))
 
 
-def build_manifest(data_dir: Path, bundle_size_warn: int | None = None) -> dict[str, Any]:
+def build_manifest(data_dir: Path, min_T_warn: int | None = None) -> dict[str, Any]:
     files = find_pt_files(data_dir)
     if not files:
         raise FileNotFoundError(f"No .pt files (excluding ._*) in {data_dir}")
@@ -79,14 +80,14 @@ def build_manifest(data_dir: Path, bundle_size_warn: int | None = None) -> dict[
                 f"{path}: num_nodes={N} disagrees with first-file num_nodes={num_nodes}"
             )
 
-        if bundle_size_warn is not None and T <= bundle_size_warn:
+        if min_T_warn is not None and T < min_T_warn:
             warned_files.append((path.name, T))
         entries.append({"path": path.name, "T": T})
 
     if warned_files:
         print(
             f"[manifest] warning: {len(warned_files)} files have "
-            f"T <= bundle_size_warn={bundle_size_warn}:",
+            f"T < min_T_warn={min_T_warn}:",
             file=sys.stderr,
         )
         for name, T in warned_files[:10]:
@@ -111,10 +112,10 @@ def main() -> int:
         help="Override output path (default: <data_dir>/manifest.json).",
     )
     parser.add_argument(
-        "--bundle_size_warn",
+        "--min_T_warn",
         type=int,
         default=None,
-        help="Warn for files with T <= this value.",
+        help="Warn for files with T < this value (e.g. 25 for warm-up model).",
     )
     args = parser.parse_args()
 
@@ -122,7 +123,7 @@ def main() -> int:
         print(f"error: {args.data_dir} is not a directory", file=sys.stderr)
         return 2
 
-    manifest = build_manifest(args.data_dir, bundle_size_warn=args.bundle_size_warn)
+    manifest = build_manifest(args.data_dir, min_T_warn=args.min_T_warn)
     out = args.output or (args.data_dir / "manifest.json")
     out.write_text(json.dumps(manifest, indent=2))
     print(f"[manifest] wrote {len(manifest['files'])} entries -> {out}")

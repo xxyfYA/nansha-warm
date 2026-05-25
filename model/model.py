@@ -255,22 +255,21 @@ class GeoFNO2d(nn.Module):
     ):
         super(GeoFNO2d, self).__init__()
         """
-        Geo-FNO for 2D irregular mesh hydrodynamic prediction (h-only).
+        Geo-FNO for 2D irregular mesh hydrodynamic prediction (warm-up model).
 
-        Input: (batch, N_nodes, in_channels) -- node features on irregular mesh
-        Output: (batch, bundle_size, N_nodes, 1) -- predicted h on same irregular mesh
+        Input: (batch, N_nodes, in_channels) -- 24h forcing features on irregular mesh
+        Output: (batch, N_nodes, 1) -- predicted h at t+24 on same irregular mesh
 
         The network:
         1. Lifts input to width-dimensional channel space via fc0.
         2. Maps from irregular mesh to regular grid via IPHI + spectral conv (conv0).
         3. num_fno_layers layers of spectral conv + 1x1 conv on the regular grid.
         4. Maps back from regular grid to irregular mesh via IPHI + spectral conv (conv4).
-        5. Projects from channel space to output via fc1, fc2.
+        5. Projects from channel space to output (single h value) via fc1, fc2.
         """
         if num_fno_layers < 1:
             raise ValueError(f"num_fno_layers must be >= 1, got {num_fno_layers}")
         self.num_fno_layers = num_fno_layers
-        self.num_channels = 1
         self.modes1 = modes1
         self.modes2 = modes2
         self.width = width
@@ -279,7 +278,6 @@ class GeoFNO2d(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.fc1_hidden = fc1_hidden
-        self.bundle_size = out_channels
 
         # Lifting layer
         self.fc0 = nn.Linear(in_channels, self.width)
@@ -318,21 +316,14 @@ class GeoFNO2d(nn.Module):
     def forward(self, u, x_in, x_out=None):
         """
         Args:
-            u: (batch, N_nodes, in_channels) -- node features. The first channel
-               must be the current normalized h state.
+            u: (batch, N_nodes, in_channels) -- 24h forcing features
             x_in: (batch, N_nodes, 2) -- 2D coordinates of input nodes
             x_out: (batch, N_nodes, 2) -- 2D coordinates of output nodes (default: same as x_in)
         Returns:
-            (batch, bundle_size, N_nodes, 1) -- predicted future normalized h states.
+            (batch, N_nodes, 1) -- predicted h at t+24 (direct, no residual)
         """
         if x_out is None:
             x_out = x_in
-        if u.size(-1) < 1:
-            raise ValueError(
-                f"GeoFNO2d requires at least 1 input channel, got {u.size(-1)}"
-            )
-
-        state_in = u[..., :1]
 
         grid = self.get_grid([u.shape[0], self.s1, self.s2], u.device).permute(0, 3, 1, 2)
 
@@ -359,12 +350,8 @@ class GeoFNO2d(nn.Module):
         u = u.permute(0, 2, 1)  # (batch, N, width)
         u = self.fc1(u)
         u = F.gelu(u)
-        delta_flat = self.fc2(u)
-        batch_size, num_nodes, _ = delta_flat.shape
-        delta = delta_flat.view(batch_size, num_nodes, self.bundle_size, 1)
-        delta = delta.permute(0, 2, 1, 3).contiguous()
-        pred_block = state_in.unsqueeze(1) + delta
-        return pred_block  # (batch, bundle_size, N, 1)
+        h_pred = self.fc2(u)  # (batch, N, out_channels) = (batch, N, 1)
+        return h_pred
 
     def get_grid(self, shape, device):
         batchsize, size_x, size_y = shape[0], shape[1], shape[2]

@@ -1,4 +1,4 @@
-"""Training loop for Geo-FNO bundle-only mode."""
+"""Training loop for Geo-FNO warm-up prediction model."""
 from __future__ import annotations
 
 import copy
@@ -73,20 +73,8 @@ def rel_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> 
     return (num / den).mean()
 
 
-def _apply_h_state_noise(features: torch.Tensor, noise_sigma: float) -> None:
-    """Add i.i.d. Gaussian noise to the h state-in channel (in-place).
-
-    Only ``features[..., 0:1]`` is modified; other channels stay unchanged.
-    When ``noise_sigma <= 0`` this is a no-op.
-    """
-    if noise_sigma <= 0.0:
-        return
-    noise = torch.randn_like(features[..., 0:1]) * noise_sigma
-    features[..., 0:1].add_(noise)
-
-
 def evaluate_model(model, test_loader, device, coords_2d_device, dist_ctx: dict | None = None):
-    """Bundle evaluation in normalized space; no autoregressive rollout (h-only)."""
+    """Single-step evaluation in normalized space (h-only)."""
     model.eval()
     total_sse = 0.0
     total_sae = 0.0
@@ -96,30 +84,26 @@ def evaluate_model(model, test_loader, device, coords_2d_device, dist_ctx: dict 
 
     x_in_base = coords_2d_device.to(device, non_blocking=True).unsqueeze(0)
     with torch.no_grad():
-        for features, target_block in test_loader:
+        for features, target in test_loader:
             features = features.to(device, non_blocking=True)
-            target_block = target_block.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
             batch_size = features.shape[0]
-            if target_block.shape[-1] != 1:
-                raise ValueError(
-                    f"target_block last dim {target_block.shape[-1]} != 1 (h-only)"
-                )
             x_in = x_in_base.expand(batch_size, -1, -1)
 
-            pred_block = model(features, x_in)
-            diff = pred_block - target_block
+            pred = model(features, x_in)
+            diff = pred - target
 
             total_sse += (diff ** 2).sum().item()
             total_sae += diff.abs().sum().item()
 
             diff_flat = diff.reshape(batch_size, -1)
-            target_flat = target_block.reshape(batch_size, -1)
+            target_flat = target.reshape(batch_size, -1)
             diff_norm = torch.linalg.vector_norm(diff_flat, ord=2, dim=1)
             target_norm = torch.linalg.vector_norm(target_flat, ord=2, dim=1).clamp(min=1e-8)
             total_rel_l2 += (diff_norm / target_norm).sum().item()
 
             num_samples += batch_size
-            total_elements += target_block.numel()
+            total_elements += target.numel()
 
     totals = reduce_sums(
         [total_sse, total_sae, total_rel_l2, num_samples, total_elements],
@@ -163,12 +147,9 @@ def train_model(
     train_sampler=None,
     dist_ctx: dict | None = None,
     accum_steps: int = 1,
-    noise_sigma: float = 0.0,
 ):
     if accum_steps < 1:
         raise ValueError(f"accum_steps must be >= 1, got {accum_steps}")
-    if noise_sigma < 0.0:
-        raise ValueError(f"noise_sigma must be >= 0, got {noise_sigma}")
     if loss_type == "rmse":
         criterion = RMSELoss()
     elif loss_type == "rel_l2":
@@ -210,17 +191,16 @@ def train_model(
 
             features = features.to(device, non_blocking=True)
             target_block = target_block.to(device, non_blocking=True)
-            _apply_h_state_noise(features, noise_sigma)
             batch_size = features.shape[0]
 
             should_sync = (micro_idx + 1) % accum_steps == 0
             with _ddp_sync_context(model, should_sync, dist_ctx):
                 x_in = x_in_base.expand(batch_size, -1, -1)
-                pred_block = model(features, x_in)
+                pred = model(features, x_in)
                 if loss_type == "rmse":
-                    loss = criterion(pred_block, target_block)
+                    loss = criterion(pred, target_block)
                 else:
-                    loss = rel_l2_loss(pred_block, target_block)
+                    loss = rel_l2_loss(pred, target_block)
                 loss = loss / accum_steps
                 loss.backward()
 

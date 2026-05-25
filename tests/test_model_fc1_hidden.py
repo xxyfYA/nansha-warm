@@ -8,13 +8,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "model"))
 from model import GeoFNO2d  # noqa: E402
 
 
-def _build(fc1_hidden=256, bundle_size=2):
+def _build(fc1_hidden=256, in_channels=120, out_channels=1):
     return GeoFNO2d(
         modes1=2,
         modes2=2,
         width=4,
-        in_channels=5 * bundle_size + 9,
-        out_channels=bundle_size,
+        in_channels=in_channels,
+        out_channels=out_channels,
         s1=4,
         s2=4,
         num_fno_layers=1,
@@ -27,8 +27,8 @@ def test_fc1_hidden_default_is_256():
         modes1=2,
         modes2=2,
         width=4,
-        in_channels=5 * 2 + 9,
-        out_channels=2,
+        in_channels=120,
+        out_channels=1,
         s1=4,
         s2=4,
         num_fno_layers=1,
@@ -48,14 +48,14 @@ def test_forward_shape_unchanged_when_fc1_hidden_changes():
     model_custom = _build(fc1_hidden=128)
 
     batch_size, num_nodes = 1, 5
-    u = torch.randn(batch_size, num_nodes, 5 * 2 + 9)
+    u = torch.randn(batch_size, num_nodes, 120)
     x = torch.rand(batch_size, num_nodes, 2)
 
     out_default = model_default(u, x)
     out_custom = model_custom(u, x)
 
-    assert out_default.shape == (batch_size, 2, num_nodes, 1)
-    assert out_custom.shape == (batch_size, 2, num_nodes, 1)
+    assert out_default.shape == (batch_size, num_nodes, 1)
+    assert out_custom.shape == (batch_size, num_nodes, 1)
 
 
 def test_parameter_count_increases_with_fc1_hidden():

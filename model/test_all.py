@@ -1,4 +1,9 @@
-"""Autoregressive multi-step test for Geo-FNO bundle model across a test split (h-only)."""
+"""Single-step direct prediction test for Geo-FNO warm-up model (h-only).
+
+For each .pt file in the test split, iterates over all valid start positions,
+uses the 24-hour forcing window to predict h at t+24, and compares against
+ground truth.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,45 +14,42 @@ import scipy.io
 import torch
 from tqdm import tqdm
 
-from dataset import load_static_coords
+from dataset import build_features, load_pt
 from main import set_seed
 from model import GeoFNO2d
 from temporal_utils import (
     CHANNEL_NAME,
+    C_IN,
+    C_OUT,
+    INPUT_WINDOW,
     build_checkpoint_name,
-    input_channels_for_bundle,
-    output_channels_for_bundle,
-    validate_temporal_params,
 )
 
 
 METRIC_SPACES = ("physical", "normalized")
 WATER_LEVEL_CHANNEL = 2
 DRY_WATER_LEVEL_THRESHOLD = 0.005
-REQUIRED_KEYS = ("graph", "storm_boundary", "inner_boundary")
 GRAPH_STATS_KEYS = ("graph_mean", "graph_std")
 LEGACY_STATS_KEYS = ("u_mean", "u_std", "v_mean", "v_std", "h_mean", "h_std")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run Geo-FNO autoregressive test across a split (h-only).",
+        description="Run Geo-FNO warm-up single-step test across a split (h-only).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--test_dir", type=str, default="data/test", help="Path to test split directory.")
     parser.add_argument("--coords", type=str, default="data/coordinates.mat", help="Path to coordinates.mat.")
     parser.add_argument("--norm", type=str, default="data/normalization.mat", help="Path to normalization.mat.")
     parser.add_argument("--model", type=str, default=None, help="Checkpoint path.")
-    parser.add_argument("--output", type=str, default="geofno_autoregressive_results.txt", help="Base output path.")
-    parser.add_argument("--max_rollout", type=int, default=72, help="Max autoregressive rollout length per file (steps).")
+    parser.add_argument("--output", type=str, default="geofno_warmup_results.txt", help="Base output path.")
     parser.add_argument("--num_files", type=int, default=None, help="Limit number of files for smoke tests.")
-    parser.add_argument("--bundle_size", type=int, default=8, help="Bundle prediction size.")
     parser.add_argument("--allow_random_weights", action="store_true", help="Run without a checkpoint.")
-    parser.add_argument("--modes", type=int, default=16, help="Fourier modes per axis.")
-    parser.add_argument("--width", type=int, default=32, help="Model width.")
+    parser.add_argument("--modes", type=int, default=24, help="Fourier modes per axis.")
+    parser.add_argument("--width", type=int, default=48, help="Model width.")
     parser.add_argument("--s1", type=int, default=64, help="Internal grid size along axis 1.")
     parser.add_argument("--s2", type=int, default=64, help="Internal grid size along axis 2.")
-    parser.add_argument("--num_fno_layers", type=int, default=3, help="Number of FNO layers.")
+    parser.add_argument("--num_fno_layers", type=int, default=4, help="Number of FNO layers.")
     parser.add_argument("--fc1_hidden", type=int, default=256, help="Hidden dim of the post-FNO FC1 layer.")
     parser.add_argument("--device", type=str, default="auto", help="Device string or auto.")
     return parser.parse_args()
@@ -104,7 +106,7 @@ def denormalize(tensor, mean, std):
 
 
 def apply_dry_grid_error_mask(diff, target_full_norm, mean_full, std_full):
-    """Legacy eval: set only the metric diff to zero on dry physical target nodes."""
+    """Set the metric diff to zero on dry physical target nodes."""
     target_wl = denormalize(
         target_full_norm[..., WATER_LEVEL_CHANNEL],
         mean_full[..., WATER_LEVEL_CHANNEL],
@@ -144,7 +146,9 @@ def resolve_checkpoint_path(explicit, default_name):
     ]
     existing = [path for path in candidates if path.exists()]
     if not existing:
-        raise FileNotFoundError("Checkpoint not found. Checked: " + ", ".join(str(p) for p in candidates))
+        raise FileNotFoundError(
+            "Checkpoint not found. Checked: " + ", ".join(str(p) for p in candidates)
+        )
     return str(max(existing, key=lambda p: p.stat().st_mtime))
 
 
@@ -161,84 +165,19 @@ def load_checkpoint(model, ckpt_path, device, model_args):
         ) from exc
 
 
-def init_bucket(device):
-    return {
-        "sse": torch.zeros(1, device=device),
-        "sae": torch.zeros(1, device=device),
-        "sum_gt": torch.zeros(1, device=device),
-        "sum_sq_gt": torch.zeros(1, device=device),
-        "rel_l2_sum": torch.zeros(1, device=device),
-        "count": 0,
-    }
-
-
-def compute_stats(bucket, num_nodes):
-    count = bucket["count"]
-    if count == 0:
-        zeros = np.zeros(1, dtype=np.float64)
-        return {
-            "mse_channels": zeros,
-            "rmse_channels": zeros,
-            "mae_channels": zeros,
-            "r2_channels": zeros,
-            "rel_l2_channels": zeros,
-        }
-
-    num_values = count * num_nodes
-    sse = bucket["sse"]
-    sae = bucket["sae"]
-    mse_channels = sse / num_values
-    rmse_channels = np.sqrt(mse_channels)
-    mae_channels = sae / num_values
-    ss_tot = bucket["sum_sq_gt"] - (bucket["sum_gt"] ** 2) / num_values
-    ss_tot = np.maximum(ss_tot, 1e-8)
-    r2_channels = 1.0 - (sse / ss_tot)
-    rel_l2_channels = bucket["rel_l2_sum"] / count
-    return {
-        "mse_channels": mse_channels,
-        "rmse_channels": rmse_channels,
-        "mae_channels": mae_channels,
-        "r2_channels": r2_channels,
-        "rel_l2_channels": rel_l2_channels,
-    }
-
-
-def compute_auc(results):
-    auc = {"h": {}}
-    steps = [entry["step"] for entry in results]
-    if len(steps) < 2:
-        for metric in ("mse", "rmse", "mae", "r2", "rel_l2"):
-            auc["h"][metric] = 0.0
-        return auc
-
-    metrics = [key for key in results[0]["h"].keys() if key != "step"]
-    for metric in metrics:
-        values = [entry["h"][metric] for entry in results]
-        auc["h"][metric] = float(np.trapz(values, steps))
-    return auc
-
-
-def build_features_batch(state_t, storm_window, inner_window, btype_oh):
-    """Build batched node features for one autoregressive bundle block."""
-    batch_size, _, num_nodes, _ = storm_window.shape
-    storm_flat = storm_window.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, -1)
-    inner_flat = inner_window.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, -1)
-    btype_batch = btype_oh.unsqueeze(0).expand(batch_size, -1, -1)
-    return torch.cat([state_t, storm_flat, inner_flat, btype_batch], dim=-1).contiguous()
-
-
 def find_test_files(test_dir):
     return sorted(path for path in Path(test_dir).glob("*.pt") if not path.name.startswith("._"))
 
 
-def prescan_files(file_paths, bundle_size, max_rollout):
-    """Pass-1 scan: load each .pt to read graph T, classify evaluable vs skipped.
+def prescan_files(file_paths):
+    """Scan each .pt to read graph T; return evaluable files.
 
     Returns:
-        evaluable: list of (path, T, target_steps) for files with T > bundle_size
-        skipped: list of (path, T) for files with T <= bundle_size
-        bucket_len: max target_steps across evaluable files (0 if none)
+        evaluable: list of (path, T, num_samples) for files with T >= 25
+        skipped: list of (path, T) for files too short
+        total_samples: total number of (input, target) pairs across evaluable files
     """
+    min_T = INPUT_WINDOW + 1
     evaluable = []
     skipped = []
     for path in tqdm(file_paths, desc="Pre-scan T"):
@@ -247,106 +186,47 @@ def prescan_files(file_paths, bundle_size, max_rollout):
             raise KeyError(f"{path}: missing 'graph' key; got {list(data.keys())}")
         num_time = int(data["graph"].shape[0])
         del data
-        if num_time <= bundle_size:
+        if num_time < min_T:
             skipped.append((path, num_time))
             continue
-        target_steps = min(max_rollout, num_time - 1)
-        evaluable.append((path, num_time, target_steps))
-    bucket_len = max((target_steps for _, _, target_steps in evaluable), default=0)
-    return evaluable, skipped, bucket_len
+        evaluable.append((path, num_time, num_time - INPUT_WINDOW))
+    total_samples = sum(samples for _, _, samples in evaluable)
+    return evaluable, skipped, total_samples
 
 
-def load_event_file(file_path, expected_nodes):
-    data = torch.load(file_path, map_location="cpu", weights_only=False)
-    for key in REQUIRED_KEYS:
-        if key not in data:
-            raise KeyError(f"{file_path}: missing key {key!r}; got {list(data.keys())}")
-
-    graph = data["graph"].float()
-    storm = data["storm_boundary"].float()
-    inner = data["inner_boundary"].float()
-
-    if graph.dim() != 3 or graph.size(-1) != 3:
-        raise ValueError(f"{file_path}: graph must be (T,N,3), got {tuple(graph.shape)}")
-    if storm.shape != graph.shape:
-        raise ValueError(f"{file_path}: storm_boundary {tuple(storm.shape)} != graph {tuple(graph.shape)}")
-    if (
-        inner.dim() != 3
-        or inner.size(0) != graph.size(0)
-        or inner.size(1) != graph.size(1)
-        or inner.size(-1) != 2
-    ):
-        raise ValueError(
-            f"{file_path}: inner_boundary {tuple(inner.shape)} incompatible with graph "
-            f"{tuple(graph.shape)}; expected (T,N,2)"
-        )
-    if graph.size(1) != expected_nodes:
-        raise ValueError(f"{file_path}: N={graph.size(1)} != coordinates N={expected_nodes}")
-
-    return graph, storm, inner
-
-
-def autoregressive_one_file(
+def evaluate_one_file(
     model,
     file_path,
     coords_2d_device,
-    btype_oh_device,
     mean_sub,
     std_sub,
     mean_full,
     std_full,
     device,
-    target_steps,
-    bundle_size,
-    per_step_metrics_by_space,
+    num_samples,
 ):
-    """Run a single autoregressive rollout (h-only)."""
-    graph_all, storm_all, inner_all = load_event_file(file_path, coords_2d_device.size(0))
+    """Evaluate all valid single-step predictions for one .pt file."""
+    graph_all, storm_all, inner_all = load_pt(file_path)
     num_time = graph_all.size(0)
-    if target_steps > num_time - 1:
+    if num_samples > num_time - INPUT_WINDOW:
         raise ValueError(
-            f"{file_path}: target_steps={target_steps} exceeds T-1={num_time - 1}"
+            f"{file_path}: num_samples={num_samples} exceeds T-{INPUT_WINDOW}={num_time - INPUT_WINDOW}"
         )
 
-    x_in = coords_2d_device.unsqueeze(0)
-    real_start = graph_all[0:1, :, 2:3].to(device)
-    predictions = [None] * target_steps
+    x_in = coords_2d_device.unsqueeze(0)  # (1, N, 2)
 
-    covered = 0
+    results = []
     with torch.no_grad():
-        while covered < target_steps:
-            remaining = target_steps - covered
-            if remaining >= bundle_size:
-                input_rel = covered
-                input_state = real_start if covered == 0 else predictions[covered - 1]
-                use_full_block = True
-            else:
-                input_rel = target_steps - bundle_size
-                input_state = predictions[input_rel - 1]
-                use_full_block = False
-
-            storm_window = storm_all[input_rel : input_rel + bundle_size + 1].unsqueeze(0).to(device)
-            inner_window = inner_all[input_rel : input_rel + bundle_size + 1].unsqueeze(0).to(device)
-            features = build_features_batch(input_state, storm_window, inner_window, btype_oh_device)
-            bundle_out = model(features, x_in)
-
-            if use_full_block:
-                for i in range(bundle_size):
-                    predictions[covered + i] = bundle_out[:, i]
-                covered += bundle_size
-            else:
-                for j in range(remaining):
-                    bundle_idx = bundle_size - remaining + j
-                    predictions[covered + j] = bundle_out[:, bundle_idx]
-                covered = target_steps
-
-    with torch.no_grad():
-        for step in range(target_steps):
-            rel_idx = step + 1
-            pred_norm = predictions[step]
-            target_full_norm = graph_all[rel_idx : rel_idx + 1].to(device)
+        for t in range(num_samples):
+            storm_window = storm_all[t : t + INPUT_WINDOW].unsqueeze(0).to(device)
+            inner_window = inner_all[t : t + INPUT_WINDOW].unsqueeze(0).to(device)
+            features = build_features(storm_window[0], inner_window[0]).unsqueeze(0)
+            target_full_norm = graph_all[t + INPUT_WINDOW : t + INPUT_WINDOW + 1].to(device)
             target_norm_sub = target_full_norm[..., 2:3]
 
+            pred_norm = model(features, x_in)
+
+            step_result = {}
             for metric_space in METRIC_SPACES:
                 if metric_space == "physical":
                     pred_metric = denormalize(pred_norm, mean_sub, std_sub)
@@ -357,77 +237,84 @@ def autoregressive_one_file(
 
                 diff = pred_metric - target_metric
                 diff = apply_dry_grid_error_mask(diff, target_full_norm, mean_full, std_full)
-                bucket = per_step_metrics_by_space[metric_space][step]
-                bucket["sse"] += torch.sum(diff ** 2, dim=(0, 1))
-                bucket["sae"] += torch.sum(torch.abs(diff), dim=(0, 1))
-                bucket["sum_gt"] += torch.sum(target_metric, dim=(0, 1))
-                bucket["sum_sq_gt"] += torch.sum(target_metric ** 2, dim=(0, 1))
 
-                l2_err = torch.norm(diff.permute(0, 2, 1), p=2, dim=2)
-                l2_gt = torch.norm(target_metric.permute(0, 2, 1), p=2, dim=2).clamp(min=1e-8)
-                bucket["rel_l2_sum"] += (l2_err / l2_gt).sum(dim=0)
-                bucket["count"] += 1
+                sse = (diff ** 2).sum().item()
+                sae = diff.abs().sum().item()
+                sum_gt = target_metric.sum().item()
+                sum_sq_gt = (target_metric ** 2).sum().item()
+
+                l2_err = torch.norm(diff.reshape(1, -1), p=2, dim=1).item()
+                l2_gt = max(torch.norm(target_metric.reshape(1, -1), p=2, dim=1).item(), 1e-8)
+                rel_l2 = l2_err / l2_gt
+
+                step_result[metric_space] = {
+                    "sse": sse, "sae": sae,
+                    "sum_gt": sum_gt, "sum_sq_gt": sum_sq_gt,
+                    "rel_l2": rel_l2,
+                }
+
+            results.append({"step": t + 1, "metrics": step_result})
+
+    return results
 
 
-def write_results(
-    results_by_space,
-    output_path,
-    max_rollout,
-    bundle_size,
-    model_path,
-    total_files,
-    evaluated_files,
-    skipped_files,
-):
-    for metric_space in METRIC_SPACES:
-        out = metric_output_path(output_path, metric_space)
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w") as f:
-            f.write("Autoregressive Test Results\n")
-            f.write(f"Max rollout: {max_rollout}\n")
-            f.write(f"Bundle size: {bundle_size}\n")
-            f.write(f"Channels: {CHANNEL_NAME}\n")
-            f.write(f"Checkpoint: {model_path if model_path is not None else 'random weights'}\n")
-            f.write(f"Metric Space: {metric_space}\n")
+def compute_aggregate_stats(all_results, num_nodes):
+    """Aggregate per-step metrics across all files."""
+    by_space = {ms: {"sse": 0.0, "sae": 0.0, "sum_gt": 0.0, "sum_sq_gt": 0.0, "rel_l2_sum": 0.0, "count": 0}
+                for ms in METRIC_SPACES}
+
+    for file_results in all_results:
+        for entry in file_results:
+            for ms in METRIC_SPACES:
+                m = entry["metrics"][ms]
+                by_space[ms]["sse"] += m["sse"]
+                by_space[ms]["sae"] += m["sae"]
+                by_space[ms]["sum_gt"] += m["sum_gt"]
+                by_space[ms]["sum_sq_gt"] += m["sum_sq_gt"]
+                by_space[ms]["rel_l2_sum"] += m["rel_l2"]
+                by_space[ms]["count"] += 1
+
+    stats = {}
+    for ms in METRIC_SPACES:
+        b = by_space[ms]
+        count = max(b["count"], 1)
+        num_values = count * num_nodes
+        mse = b["sse"] / num_values
+        rmse = np.sqrt(mse)
+        mae = b["sae"] / num_values
+        ss_tot = max(b["sum_sq_gt"] - (b["sum_gt"] ** 2) / num_values, 1e-8)
+        r2 = 1.0 - (b["sse"] / ss_tot)
+        rel_l2 = b["rel_l2_sum"] / count
+        stats[ms] = {
+            "mse": mse, "rmse": rmse, "mae": mae, "r2": r2,
+            "rel_l2": rel_l2, "count": b["count"],
+        }
+    return stats
+
+
+def write_results(stats, output_path, model_path, total_files, evaluated_files, skipped_files):
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write("Geo-FNO Warm-up Single-Step Test Results\n")
+        f.write(f"Metric Spaces: {', '.join(METRIC_SPACES)}\n")
+        f.write(f"Channels: {CHANNEL_NAME}\n")
+        f.write(f"Checkpoint: {model_path if model_path is not None else 'random weights'}\n")
+        f.write(
+            f"Total files: {total_files} "
+            f"(evaluated: {evaluated_files}, skipped: {skipped_files})\n"
+        )
+        f.write("=" * 80 + "\n")
+        f.write(f"{'Metric Space':<14} | {'MSE':<12} | {'RMSE':<12} | {'MAE':<12} | {'R2':<12} | {'Rel L2':<12} | {'N':<8}\n")
+        f.write("-" * 80 + "\n")
+        for ms in METRIC_SPACES:
+            s = stats[ms]
             f.write(
-                f"Total files: {total_files} "
-                f"(evaluated: {evaluated_files}, skipped: {skipped_files})\n"
+                f"{ms:<14} | {s['mse']:<12.6f} | {s['rmse']:<12.6f} | "
+                f"{s['mae']:<12.6f} | {s['r2']:<12.6f} | "
+                f"{s['rel_l2']:<12.6f} | {s['count']:<8}\n"
             )
-            f.write("=" * 110 + "\n")
-            f.write(
-                f"{'Step':<6} | {'Channel':<7} | {'MSE':<12} | {'RMSE':<12} | "
-                f"{'MAE':<12} | {'R2':<12} | {'Rel L2':<12} | {'N':<6}\n"
-            )
-            f.write("-" * 110 + "\n")
-
-            for result in results_by_space[metric_space]:
-                step = result["step"]
-                count = result["count"]
-                metrics = result["h"]
-                f.write(
-                    f"{step:<6} | {'wl':<7} | {metrics['mse']:<12.6f} | "
-                    f"{metrics['rmse']:<12.6f} | {metrics['mae']:<12.6f} | "
-                    f"{metrics['r2']:<12.6f} | {metrics['rel_l2']:<12.6f} | {count:<6}\n"
-                )
-                f.write("-" * 110 + "\n")
-
-            auc = compute_auc(results_by_space[metric_space])
-            f.write("\n" + "=" * 100 + "\n")
-            f.write(f"AUC Summary Over {len(results_by_space[metric_space])} Steps\n")
-            f.write("-" * 100 + "\n")
-            f.write(
-                f"{'Channel':<11} | {'MSE Area':<12} | {'RMSE Area':<12} | "
-                f"{'MAE Area':<12} | {'R2 Area':<12} | {'Rel L2 Area':<12}\n"
-            )
-            f.write("-" * 100 + "\n")
-            metrics = auc["h"]
-            f.write(
-                f"{'wl':<11} | {metrics['mse']:<12.6f} | {metrics['rmse']:<12.6f} | "
-                f"{metrics['mae']:<12.6f} | {metrics['r2']:<12.6f} | "
-                f"{metrics['rel_l2']:<12.6f}\n"
-            )
-            f.write("=" * 100 + "\n")
-        print(f"[test] results -> {out}")
+        f.write("=" * 80 + "\n")
+    print(f"[test] results -> {output_path}")
 
 
 def main():
@@ -439,24 +326,16 @@ def main():
     print(f"[test] device={device}")
 
     set_seed(3407)
-    validate_temporal_params(args.bundle_size)
-    if args.max_rollout < args.bundle_size:
-        raise ValueError(
-            f"max_rollout must be >= bundle_size: max_rollout={args.max_rollout}, "
-            f"bundle_size={args.bundle_size}"
-        )
 
-    coords_2d_cpu, btype_oh_cpu = load_static_coords(args.coords)
+    coords_2d_cpu = load_static_coords(args.coords)
     coords_2d_device = coords_2d_cpu.to(device)
-    btype_oh_device = btype_oh_cpu.to(device)
     num_nodes = coords_2d_cpu.size(0)
 
     mean_sub, std_sub, mean_full, std_full = load_normalization_stats(args.norm, device=device)
 
-    in_channels = input_channels_for_bundle(args.bundle_size)
-    out_channels = output_channels_for_bundle(args.bundle_size)
+    in_channels = C_IN
+    out_channels = C_OUT
     model_args = {
-        "bundle_size": args.bundle_size,
         "in_channels": in_channels,
         "out_channels": out_channels,
         "modes": args.modes,
@@ -479,7 +358,7 @@ def main():
     ).to(device)
     print(f"[test] model params={sum(p.numel() for p in model.parameters()):,}")
 
-    default_checkpoint = build_checkpoint_name(args.bundle_size)
+    default_checkpoint = build_checkpoint_name()
     try:
         model_path = resolve_checkpoint_path(args.model, default_checkpoint)
     except FileNotFoundError:
@@ -500,73 +379,39 @@ def main():
     if not test_files:
         raise FileNotFoundError(f"No .pt files in {args.test_dir}")
 
-    evaluable, skipped, bucket_len = prescan_files(
-        test_files, args.bundle_size, args.max_rollout
-    )
+    evaluable, skipped, total_samples = prescan_files(test_files)
     print(
         f"[test] prescan: total={len(test_files)} "
-        f"evaluable={len(evaluable)} skipped={len(skipped)} bucket_len={bucket_len}"
+        f"evaluable={len(evaluable)} skipped={len(skipped)} "
+        f"total_samples={total_samples}"
     )
     if not evaluable:
         raise RuntimeError(
             f"No files eligible for evaluation. total={len(test_files)}, "
-            f"skipped={len(skipped)}, bundle_size={args.bundle_size}"
+            f"skipped={len(skipped)}, need T >= {INPUT_WINDOW + 1}"
         )
 
-    per_step_metrics_by_space = {
-        metric_space: [init_bucket(device) for _ in range(bucket_len)]
-        for metric_space in METRIC_SPACES
-    }
-
-    for path, _T, target_steps in tqdm(evaluable, desc="Test files"):
-        autoregressive_one_file(
-            model,
-            path,
-            coords_2d_device,
-            btype_oh_device,
-            mean_sub,
-            std_sub,
-            mean_full,
-            std_full,
-            device,
-            target_steps,
-            args.bundle_size,
-            per_step_metrics_by_space,
+    all_results = []
+    for path, _T, num_samples in tqdm(evaluable, desc="Test files"):
+        file_results = evaluate_one_file(
+            model, path, coords_2d_device,
+            mean_sub, std_sub, mean_full, std_full,
+            device, num_samples,
         )
+        all_results.append(file_results)
 
-    for metric_space in METRIC_SPACES:
-        for step in range(bucket_len):
-            bucket = per_step_metrics_by_space[metric_space][step]
-            for key in ("sse", "sae", "sum_gt", "sum_sq_gt", "rel_l2_sum"):
-                bucket[key] = bucket[key].detach().cpu().numpy()
+    stats = compute_aggregate_stats(all_results, num_nodes)
 
-    results_by_space = {metric_space: [] for metric_space in METRIC_SPACES}
-    for metric_space in METRIC_SPACES:
-        for step, bucket in enumerate(per_step_metrics_by_space[metric_space]):
-            stats = compute_stats(bucket, num_nodes)
-            result = {"step": step + 1, "count": int(bucket["count"])}
-            result["h"] = {
-                "mse": float(stats["mse_channels"][0]),
-                "rmse": float(stats["rmse_channels"][0]),
-                "mae": float(stats["mae_channels"][0]),
-                "r2": float(stats["r2_channels"][0]),
-                "rel_l2": float(stats["rel_l2_channels"][0]),
-            }
-            results_by_space[metric_space].append(result)
-
-            metrics = result["h"]
-            print(
-                f"[step {step + 1:02d}][{metric_space}][N={int(bucket['count'])}] "
-                f"wl: mse={metrics['mse']:.6f} rmse={metrics['rmse']:.6f} "
-                f"mae={metrics['mae']:.6f} r2={metrics['r2']:.6f} "
-                f"rel_l2={metrics['rel_l2']:.6f}"
-            )
+    for ms in METRIC_SPACES:
+        s = stats[ms]
+        print(
+            f"[{ms}] N={s['count']} "
+            f"mse={s['mse']:.6f} rmse={s['rmse']:.6f} "
+            f"mae={s['mae']:.6f} r2={s['r2']:.6f} rel_l2={s['rel_l2']:.6f}"
+        )
 
     write_results(
-        results_by_space,
-        args.output,
-        args.max_rollout,
-        args.bundle_size,
+        stats, args.output,
         model_path,
         total_files=len(test_files),
         evaluated_files=len(evaluable),
