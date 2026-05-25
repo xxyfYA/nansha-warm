@@ -1,0 +1,36 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Project data (too large for git)
+data/
+*.pt
+!model/*.pt
+*.mat
+
+# Training artifacts
+runs/
+checkpoints/
+*.pth
+*.ckpt
+best_*.pt
+
+# Manifests are reproducible from data
+**/manifest.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code state
+.claude/
+*.txt
+model_warmup/
