@@ -205,7 +205,7 @@ nansha/
 │   │                                                            │             │
 │   │    if accum_steps ready:                                   │             │
 │   │        clip_grad_norm_(1.0)                                │             │
-│   │        optimizer.step()      ← AdamW, lr=1e-3              │             │
+│   │        optimizer.step()      ← AdamW, lr=1e-4              │             │
 │   │        scheduler.step()      ← Warmup + Cosine Decay      │             │
 │   │        ema.update(model)     ← decay=0.999                 │             │
 │   │        optimizer.zero_grad()                                │             │
