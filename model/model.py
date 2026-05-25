@@ -62,34 +62,44 @@ class SpectralConv2d(nn.Module):
 
     def _fourier_basis(self, x: torch.Tensor, sign: float) -> torch.Tensor:
         # x: (N, 2), output: (N, 2*modes1, 2*modes2-1)
+        # Computed in chunks to limit peak GPU memory on large meshes.
         num_nodes = x.shape[0]
         m1 = 2 * self.modes1
         m2 = 2 * self.modes2 - 1
-        k_x1 = self.k_x1
-        k_x2 = self.k_x2
+        k1_flat = self.k_x1.reshape(-1)
+        k2_flat = self.k_x2.reshape(-1)
 
-        K1 = torch.outer(x[:, 0].reshape(-1), k_x1.reshape(-1)).reshape(num_nodes, m1, m2)
-        K2 = torch.outer(x[:, 1].reshape(-1), k_x2.reshape(-1)).reshape(num_nodes, m1, m2)
-        K = K1 + K2
-        return torch.exp((sign * 1j) * 2 * np.pi * K)
+        chunk_size = 4096
+        chunks = []
+        for start in range(0, num_nodes, chunk_size):
+            end = min(start + chunk_size, num_nodes)
+            xc = x[start:end]
+            K1 = torch.outer(xc[:, 0], k1_flat).reshape(-1, m1, m2)
+            K2 = torch.outer(xc[:, 1], k2_flat).reshape(-1, m1, m2)
+            K = K1 + K2
+            chunks.append(torch.exp((sign * 1j) * 2 * np.pi * K))
+        return torch.cat(chunks, dim=0)
 
     def _batched_fourier_basis(self, x: torch.Tensor, sign: float) -> torch.Tensor:
         # x: (B, N, 2), output: (B, N, 2*modes1, 2*modes2-1)
+        # Computed in chunks to limit peak GPU memory on large meshes.
         batchsize = x.shape[0]
         num_nodes = x.shape[1]
         m1 = 2 * self.modes1
         m2 = 2 * self.modes2 - 1
-        k_x1 = self.k_x1
-        k_x2 = self.k_x2
+        k1_flat = self.k_x1.reshape(-1)
+        k2_flat = self.k_x2.reshape(-1)
 
-        K1 = torch.outer(x[..., 0].reshape(-1), k_x1.reshape(-1)).reshape(
-            batchsize, num_nodes, m1, m2
-        )
-        K2 = torch.outer(x[..., 1].reshape(-1), k_x2.reshape(-1)).reshape(
-            batchsize, num_nodes, m1, m2
-        )
-        K = K1 + K2
-        return torch.exp((sign * 1j) * 2 * np.pi * K)
+        chunk_size = 4096
+        chunks = []
+        for start in range(0, num_nodes, chunk_size):
+            end = min(start + chunk_size, num_nodes)
+            xc = x[:, start:end]
+            K1 = torch.outer(xc[..., 0].reshape(-1), k1_flat).reshape(batchsize, -1, m1, m2)
+            K2 = torch.outer(xc[..., 1].reshape(-1), k2_flat).reshape(batchsize, -1, m1, m2)
+            K = K1 + K2
+            chunks.append(torch.exp((sign * 1j) * 2 * np.pi * K))
+        return torch.cat(chunks, dim=1)
 
     def compl_mul2d(self, input, weights):
         # (batch, in_channel, x, y), (in_channel, out_channel, x, y) -> (batch, out_channel, x, y)
