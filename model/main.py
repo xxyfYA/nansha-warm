@@ -54,15 +54,15 @@ CONFIG = {
     "num_workers": 4,
     "lru_files_per_worker": 2,
 
-    "modes": 24,
-    "width": 48,
+    "modes": 32,
+    "width": 96,
     "s1": 64,
     "s2": 64,
     "num_fno_layers": 4,
     "fc1_hidden": 256,
 
     "num_epochs": 200,
-    "lr": 1e-3,
+    "lr": 1e-4,
     "weight_decay": 1e-4,
     "warmup_ratio": 0.05,
     "min_lr_ratio": 0.01,
