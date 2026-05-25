@@ -38,39 +38,33 @@ nansha/
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐                               │
-│  │ train/*.pt│    │  val/*.pt│    │ test/*.pt│    每个 .pt 文件:              │
-│  └────┬─────┘    └────┬─────┘    └────┬─────┘    T × N 节点                  │
-│       │               │               │          graph / storm / inner       │
+│  │ train/*.pt│    │  val/*.pt│    │ test/*.pt│    每个 .pt 文件 = 1 个样本    │
+│  └────┬─────┘    └────┬─────┘    └────┬─────┘    storm(24h) + inner(24h)    │
+│       │               │               │          → 预测 target h(t+24)      │
 │       ▼               ▼               ▼                                      │
 │  ┌─────────────────────────────────────────┐                                │
-│  │        build_manifest.py                │  扫描 T, N, 生成 manifest.json  │
-│  │  --min_T_warn 25                       │  过滤 T < 25 的文件             │
+│  │        build_manifest.py                │  扫描文件, 校验格式, 生成 manifest│
 │  └────────────────┬────────────────────────┘                                │
 │                   ▼                                                          │
 │  ┌─────────────────────────────────────────┐                                │
-│  │        MultiStormSurgeDataset            │  T < 25 的文件自动过滤          │
-│  │                                         │  构建 flat_index               │
-│  │  flat_index = [                        │  T=41 → 17 样本                 │
-│  │    (file_0, t=0),                      │  T=36 → 12 样本                 │
-│  │    (file_0, t=1),                      │  ...                            │
-│  │    ...                                 │                                 │
-│  │  ]                                     │                                 │
+│  │        MultiStormSurgeDataset            │  __len__ = 文件数              │
+│  │                                         │  内置 LRU 缓存                 │
 │  └────────────────┬────────────────────────┘                                │
 │                   │                                                          │
 │                   ▼ __getitem__                                              │
 │  ┌──────────────────────────────────────────────────────────────────┐       │
 │  │                        单个样本构造                                │       │
 │  │                                                                   │       │
-│  │  storm(t..t+23) 展开 (N, 72) ───┐                                 │       │
-│  │  inner(t..t+23) 展开 (N, 48) ───┤ cat ──► features (N, 120)      │       │
-│  │                                  │                                 │       │
-│  │  target = graph[t+24, :, 2:3] ──► (N, 1)  h(t+24)                │       │
+│  │  storm(24×3) 展开 (N, 72) ────┐                                    │       │
+│  │  inner(24×2) 展开 (N, 48) ────┤ cat ──► features (N, 120)        │       │
+│  │                               │                                    │       │
+│  │  target[:, 2:3] ─────────────► (N, 1)  h(t+24)                   │       │
 │  └──────────────────────────────────────────────────────────────────┘       │
 │                                                                             │
 │  FileChunkedDistributedSampler (DDP)                                         │
 │  ┌──────────────────────────────────────────────────────────────┐           │
-│  │ 贪心文件分配 → 大文件优先 → 各 rank 尽量均分样本数               │           │
-│  │ rank 内: 文件 shuffle → 文件内样本 shuffle → drop_last/pad     │           │
+│  │ 贪心文件分配 → 各 rank 均分样本数                               │           │
+│  │ rank 内: 文件 shuffle → drop_last/pad                        │           │
 │  └──────────────────────────────────────────────────────────────┘           │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -78,13 +72,13 @@ nansha/
 
 ### 数据格式
 
-**`.pt` 文件**（每个风暴事件一个文件）：
+**`.pt` 文件**（每个预处理样本一个文件）：
 
 | Key | Shape | 说明 |
 | --- | --- | --- |
-| `graph` | (T, N, 3) | [u流速, v流速, 水位h]，已 z-score 归一化 |
-| `storm_boundary` | (T, N, 3) | [气压P, x风速Wx, y风速Wy] |
-| `inner_boundary` | (T, N, 2) | [边界水位, 边界流量]，非边界节点为 0 |
+| `storm_boundary` | (24, N, 3) | [气压P, x风速Wx, y风速Wy] |
+| `inner_boundary` | (24, N, 2) | [边界水位, 边界流量]，非边界节点为 0 |
+| `target` | (N, 3) | [u流速, v流速, 水位h] at t+24，已 z-score 归一化 |
 
 **`coordinates.mat`**：节点坐标 N×3，`boundary` 边界类型 N×1（0/1/2），以及 fort.19/20 映射信息。仅 `coordinates` 的 xy 分量被模型使用——通过 IPHI 做不规则网格到规则域的空间映射。
 
@@ -102,7 +96,7 @@ nansha/
 ```json
 {
   "num_nodes": 190764,
-  "files": [{"path": "event_001.pt", "T": 120}, {"path": "event_002.pt", "T": 96}],
+  "files": ["event_001.pt", "event_002.pt"],
   "created_at": "2026-05-25T00:00:00+00:00"
 }
 ```
@@ -190,7 +184,7 @@ nansha/
 │       ▼                                                                     │
 │   ┌───────────────────────────────────────────────────────────┐             │
 │   │  train_loader (FileChunkedDistributedSampler)              │             │
-│   │  每卡分配整文件, 贪心平衡负载                                 │             │
+│   │  贪心分配文件到各卡, 每文件=1样本                             │             │
 │   │  batch_size=16 → 4卡 × 4/卡                                │             │
 │   └───────────────────────────────────────────────────────────┘             │
 │       │                                                                     │
@@ -313,7 +307,7 @@ python model/test_all.py \
     --output results.txt
 ```
 
-对测试集每个文件的所有有效时间点做单步直接预测，评估指标：
+对测试集每个文件做单步直接预测（每文件=1个样本），评估指标：
 
 | 指标 | 公式 | 说明 |
 | --- | --- | --- |
@@ -362,9 +356,9 @@ with torch.no_grad():
 ```bash
 # 数据准备
 python scripts/check_data_integrity.py --data_root data --deep
-python scripts/build_manifest.py data/train --min_T_warn 25
-python scripts/build_manifest.py data/val   --min_T_warn 25
-python scripts/build_manifest.py data/test  --min_T_warn 25
+python scripts/build_manifest.py data/train
+python scripts/build_manifest.py data/val
+python scripts/build_manifest.py data/test
 
 # 训练
 python model/main.py                              # 单 GPU

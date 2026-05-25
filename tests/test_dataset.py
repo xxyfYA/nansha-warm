@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "model"))
 from dataset import (  # noqa: E402
     FileChunkedDistributedSampler,
     MultiStormSurgeDataset,
-    StormSurgeDataset,
+    build_features,
+    load_pt,
     load_static_coords,
 )
 
@@ -29,31 +30,29 @@ def coords_mat(tmp_path):
     return p
 
 
-def _make_pt(path, T):
+def _make_pt(path, num_nodes=N_NODES):
+    """Create a new-format .pt file: one pre-processed sample."""
     data = {
-        "graph": torch.randn(T, N_NODES, 3),
-        "storm_boundary": torch.randn(T, N_NODES, 3),
-        "inner_boundary": torch.zeros(T, N_NODES, 2),
+        "storm_boundary": torch.randn(24, num_nodes, 3),
+        "inner_boundary": torch.zeros(24, num_nodes, 2),
+        "target": torch.randn(num_nodes, 3),
         "run_id": path.stem,
         "source_dir": "synthetic",
     }
-    data["inner_boundary"][:, :12] = torch.randn(T, 12, 2)
+    bdy_count = min(12, num_nodes)
+    data["inner_boundary"][:, :bdy_count] = torch.randn(24, bdy_count, 2)
     torch.save(data, path)
 
 
-def _make_deterministic_pt(path, T, num_nodes=3):
-    graph = torch.arange(T * num_nodes * 3, dtype=torch.float32).reshape(T, num_nodes, 3)
-    storm_boundary = 1000 + torch.arange(T * num_nodes * 3, dtype=torch.float32).reshape(
-        T, num_nodes, 3
-    )
-    inner_boundary = 2000 + torch.arange(T * num_nodes * 2, dtype=torch.float32).reshape(
-        T, num_nodes, 2
-    )
+def _make_deterministic_pt(path, num_nodes=3):
+    storm_boundary = torch.arange(24 * num_nodes * 3, dtype=torch.float32).reshape(24, num_nodes, 3)
+    inner_boundary = 1000 + torch.arange(24 * num_nodes * 2, dtype=torch.float32).reshape(24, num_nodes, 2)
+    target = 2000 + torch.arange(num_nodes * 3, dtype=torch.float32).reshape(num_nodes, 3)
     torch.save(
         {
-            "graph": graph,
             "storm_boundary": storm_boundary,
             "inner_boundary": inner_boundary,
+            "target": target,
         },
         path,
     )
@@ -63,13 +62,12 @@ def _make_deterministic_pt(path, T, num_nodes=3):
 def split_dir(tmp_path):
     d = tmp_path / "split"
     d.mkdir()
-    sizes = [80, 100, 50]
-    for i, T in enumerate(sizes):
-        _make_pt(d / f"e{i}.pt", T)
+    for i in range(3):
+        _make_pt(d / f"e{i}.pt")
     manifest = {
         "num_nodes": N_NODES,
-        "files": [{"path": f"e{i}.pt", "T": sizes[i]} for i in range(len(sizes))],
-        "created_at": "2026-05-16T00:00:00+00:00",
+        "files": [f"e{i}.pt" for i in range(3)],
+        "created_at": "2026-05-25T00:00:00+00:00",
     }
     (d / "manifest.json").write_text(json.dumps(manifest))
     return d
@@ -79,17 +77,18 @@ def split_dir(tmp_path):
 def uneven_split_dir(tmp_path):
     d = tmp_path / "uneven"
     d.mkdir()
-    sizes = [104, 54, 14]
-    for i, T in enumerate(sizes):
-        _make_pt(d / f"e{i}.pt", T)
+    for i in range(3):
+        _make_pt(d / f"e{i}.pt")
     manifest = {
         "num_nodes": N_NODES,
-        "files": [{"path": f"e{i}.pt", "T": sizes[i]} for i in range(len(sizes))],
-        "created_at": "2026-05-16T00:00:00+00:00",
+        "files": [f"e{i}.pt" for i in range(3)],
+        "created_at": "2026-05-25T00:00:00+00:00",
     }
     (d / "manifest.json").write_text(json.dumps(manifest))
     return d
 
+
+# --- load_static_coords ---
 
 def test_load_static_coords_normalizes(coords_mat):
     with warnings.catch_warnings(record=True) as warnings_record:
@@ -135,77 +134,87 @@ def test_load_static_coords_rejects_bad_coords(tmp_path):
         load_static_coords(p)
 
 
-def test_single_dataset_shapes(split_dir):
-    ds = StormSurgeDataset(
-        path=split_dir / "e0.pt",
-        lru_capacity=1,
-    )
-    assert len(ds) == 80 - 24
-    feat, target = ds[0]
-    assert feat.shape == (N_NODES, 120)
-    assert target.shape == (N_NODES, 1)
+# --- load_pt ---
+
+def test_load_pt_validates_new_format(tmp_path):
+    path = tmp_path / "sample.pt"
+    _make_pt(path, num_nodes=10)
+    entry = load_pt(path)
+    assert entry["storm"].shape == (24, 10, 3)
+    assert entry["inner"].shape == (24, 10, 2)
+    assert entry["target"].shape == (10, 3)
 
 
-def test_single_dataset_too_short_rejects(tmp_path):
-    d = tmp_path / "tiny"
-    d.mkdir()
-    _make_pt(d / "short.pt", T=20)
-    with pytest.raises(ValueError, match="T="):
-        StormSurgeDataset(path=d / "short.pt")
+def test_load_pt_rejects_missing_key(tmp_path):
+    path = tmp_path / "bad.pt"
+    torch.save({"storm_boundary": torch.randn(24, 5, 3)}, path)
+    with pytest.raises(KeyError, match="missing key"):
+        load_pt(path)
 
+
+# --- build_features ---
 
 def test_feature_layout_is_storm_inner_order(tmp_path):
     d = tmp_path / "layout"
     d.mkdir()
     path = d / "event.pt"
-    _make_deterministic_pt(path, T=30, num_nodes=2)
-    ds = StormSurgeDataset(path=path, lru_capacity=1)
+    _make_deterministic_pt(path, num_nodes=2)
 
-    features, target = ds[0]
+    entry = load_pt(path)
+    features = build_features(entry["storm"], entry["inner"])
     assert features.shape == (2, 120)
-    data = torch.load(path, map_location="cpu", weights_only=False)
+
     expected = torch.cat([
-        data["storm_boundary"][0:24, 0].reshape(-1),  # 72
-        data["inner_boundary"][0:24, 0].reshape(-1),  # 48
-    ])
-    assert torch.equal(features[0], expected)
-    assert target.shape == (2, 1)
+        entry["storm"].permute(1, 0, 2).reshape(2, -1),   # (2, 72)
+        entry["inner"].permute(1, 0, 2).reshape(2, -1),   # (2, 48)
+    ], dim=-1)
+    assert torch.equal(features, expected)
 
 
-def test_multi_dataset_index_flattening(split_dir):
-    mds = MultiStormSurgeDataset(
-        data_dir=split_dir,
-        lru_files_per_worker=1,
-    )
-    assert len(mds) == (80 - 24) + (100 - 24) + (50 - 24)
+# --- MultiStormSurgeDataset ---
+
+def test_multi_dataset_len_equals_num_files(split_dir):
+    mds = MultiStormSurgeDataset(data_dir=split_dir, lru_files_per_worker=1)
+    assert len(mds) == 3
+
+
+def test_multi_dataset_getitem_shapes(split_dir):
+    mds = MultiStormSurgeDataset(data_dir=split_dir, lru_files_per_worker=1)
     feat, target = mds[0]
     assert feat.shape == (N_NODES, 120)
     assert target.shape == (N_NODES, 1)
 
 
-def test_multi_dataset_drops_too_short_files(tmp_path):
-    d = tmp_path / "split"
+def test_multi_dataset_getitem_target_is_h_channel(split_dir):
+    mds = MultiStormSurgeDataset(data_dir=split_dir, lru_files_per_worker=1)
+    _, target = mds[0]
+    # target should be column 2 (h) of the target tensor
+    raw = torch.load(mds.files[0], map_location="cpu", weights_only=False)
+    expected_h = raw["target"][:, 2:3]
+    assert torch.equal(target, expected_h)
+
+
+def test_multi_dataset_raises_on_missing_manifest(tmp_path):
+    d = tmp_path / "empty"
     d.mkdir()
-    _make_pt(d / "tiny.pt", 10)
-    _make_pt(d / "ok.pt", 50)
-    manifest = {
-        "num_nodes": N_NODES,
-        "files": [{"path": "tiny.pt", "T": 10}, {"path": "ok.pt", "T": 50}],
-        "created_at": "2026-05-16T00:00:00+00:00",
-    }
-    (d / "manifest.json").write_text(json.dumps(manifest))
-    mds = MultiStormSurgeDataset(d, lru_files_per_worker=1)
-    assert len(mds) == 50 - 24
+    with pytest.raises(FileNotFoundError, match="manifest"):
+        MultiStormSurgeDataset(d)
 
 
-def test_file_chunked_sampler_groups_by_file(split_dir):
+def test_multi_dataset_raises_on_empty_manifest(tmp_path):
+    d = tmp_path / "empty"
+    d.mkdir()
+    (d / "manifest.json").write_text(json.dumps({"num_nodes": 10, "files": []}))
+    with pytest.raises(RuntimeError, match="empty"):
+        MultiStormSurgeDataset(d)
+
+
+# --- FileChunkedDistributedSampler ---
+
+def test_file_chunked_sampler_len_matches_dataset(split_dir):
     mds = MultiStormSurgeDataset(split_dir, lru_files_per_worker=1)
-    sampler = FileChunkedDistributedSampler(mds, num_replicas=1, rank=0, shuffle=True, seed=0)
-    indices = list(iter(sampler))
-    assert len(indices) == len(mds)
-    file_seq = [mds.flat_index[i][0] for i in indices]
-    transitions = sum(1 for a, b in zip(file_seq, file_seq[1:]) if a != b)
-    assert transitions <= len(set(file_seq)) - 1 + 2
+    sampler = FileChunkedDistributedSampler(mds, num_replicas=1, rank=0, shuffle=False, seed=0)
+    assert len(sampler) == len(mds)
 
 
 def test_file_chunked_sampler_disjoint_across_ranks(split_dir):
@@ -215,9 +224,6 @@ def test_file_chunked_sampler_disjoint_across_ranks(split_dir):
     i0 = set(iter(s0))
     i1 = set(iter(s1))
     assert i0.isdisjoint(i1)
-    f0 = {mds.flat_index[i][0] for i in i0}
-    f1 = {mds.flat_index[i][0] for i in i1}
-    assert f0.isdisjoint(f1)
 
 
 def test_file_chunked_sampler_len_is_stable_across_epochs(uneven_split_dir):
@@ -254,6 +260,8 @@ def test_balanced_sampler_drop_last_uses_min_rank_total_without_duplicates(uneve
     ]
 
     rank_indices = [list(iter(sampler)) for sampler in samplers]
+    # With 3 files and 2 ranks, min rank total = 1, so each rank gets 1
+    assert all(len(indices) == 1 for indices in rank_indices)
     assert all(len(indices) == len(set(indices)) for indices in rank_indices)
     assert set(rank_indices[0]).isdisjoint(rank_indices[1])
 
@@ -261,11 +269,11 @@ def test_balanced_sampler_drop_last_uses_min_rank_total_without_duplicates(uneve
 def test_balanced_sampler_raises_when_a_rank_has_no_samples(tmp_path):
     d = tmp_path / "single"
     d.mkdir()
-    _make_pt(d / "only.pt", 40)
+    _make_pt(d / "only.pt")
     manifest = {
         "num_nodes": N_NODES,
-        "files": [{"path": "only.pt", "T": 40}],
-        "created_at": "2026-05-16T00:00:00+00:00",
+        "files": ["only.pt"],
+        "created_at": "2026-05-25T00:00:00+00:00",
     }
     (d / "manifest.json").write_text(json.dumps(manifest))
     mds = MultiStormSurgeDataset(d)
@@ -296,7 +304,53 @@ def test_file_chunked_sampler_set_epoch_changes_shuffle(split_dir):
 
 def test_lru_eviction(split_dir):
     mds = MultiStormSurgeDataset(split_dir, lru_files_per_worker=2)
-    for fi in range(3):
-        first_idx_for_file = next(i for i, (f, _) in enumerate(mds.flat_index) if f == fi)
-        _ = mds[first_idx_for_file]
+    for i in range(3):
+        _ = mds[i]
     assert len(mds._cache) <= 2
+
+
+def test_dataset_index_error(split_dir):
+    mds = MultiStormSurgeDataset(split_dir, lru_files_per_worker=1)
+    with pytest.raises(IndexError):
+        _ = mds[-1]
+    with pytest.raises(IndexError):
+        _ = mds[len(mds)]
+
+
+def test_sampler_pad_to_equal_length(uneven_split_dir):
+    mds = MultiStormSurgeDataset(uneven_split_dir)
+    samplers = [
+        FileChunkedDistributedSampler(
+            mds,
+            num_replicas=2,
+            rank=rank,
+            shuffle=False,
+            seed=0,
+            drop_last=False,
+            pad_to_equal_length=True,
+        )
+        for rank in range(2)
+    ]
+    # With 3 files and 2 ranks: rank 0 gets 2, rank 1 gets 1
+    # pad_to_equal_length=True → both get max=2
+    rank_indices = [list(iter(sampler)) for sampler in samplers]
+    assert all(len(indices) == 2 for indices in rank_indices)
+    # The padded rank should have a duplicate
+    assert len(set(rank_indices[1])) == 1
+
+
+def test_sampler_rejects_pad_with_drop_last():
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    _make_pt(d / "e0.pt")
+    manifest = {
+        "num_nodes": N_NODES,
+        "files": ["e0.pt"],
+        "created_at": "2026-05-25T00:00:00+00:00",
+    }
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    mds = MultiStormSurgeDataset(d)
+    with pytest.raises(ValueError, match="pad_to_equal_length.*incompatible"):
+        FileChunkedDistributedSampler(
+            mds, num_replicas=1, rank=0, drop_last=True, pad_to_equal_length=True,
+        )

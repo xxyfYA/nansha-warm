@@ -1,11 +1,11 @@
 """Storm-surge lazy-loading dataset for Geo-FNO warm-up prediction model.
 
-Input per node: 24-hour forcing window (120 channels)
-    storm boundary @ t..t+23     → 24×3 = 72 channels  [P, Wx, Wy]
-    inner boundary @ t..t+23     → 24×2 = 48 channels  [h_bdy, q_bdy]
-    Total = 120 channels
+Each .pt file is one pre-processed sample:
+    storm_boundary  — (24, N, 3)   [P, Wx, Wy]
+    inner_boundary  — (24, N, 2)   [h_bdy, q_bdy]
+    target          — (N, 3)       [u, v, h] at t+24
 
-Output per node: water level h at t+24 (1 channel, direct prediction).
+The dataset takes target[:, 2:3] as the single-channel h supervision signal.
 """
 from __future__ import annotations
 
@@ -20,9 +20,7 @@ import scipy.io
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from temporal_utils import INPUT_WINDOW, C_IN
-
-REQUIRED_PT_KEYS = ("graph", "storm_boundary", "inner_boundary")
+REQUIRED_PT_KEYS = ("storm_boundary", "inner_boundary", "target")
 
 
 def load_static_coords(coords_path):
@@ -62,35 +60,30 @@ def load_static_coords(coords_path):
 
 
 def load_pt(path) -> dict[str, torch.Tensor]:
-    """Load and validate one storm event .pt file."""
+    """Load and validate one pre-processed .pt file."""
     path = Path(path)
     data = torch.load(path, map_location="cpu", weights_only=False)
     for key in REQUIRED_PT_KEYS:
         if key not in data:
             raise KeyError(f"{path}: missing key {key!r}; got {list(data.keys())}")
 
-    graph = data["graph"].float()
     storm = data["storm_boundary"].float()
     inner = data["inner_boundary"].float()
+    target = data["target"].float()
 
-    if graph.dim() != 3 or graph.size(-1) != 3:
-        raise ValueError(f"{path}: graph must be (T,N,3), got {tuple(graph.shape)}")
-    if storm.shape != graph.shape:
+    if storm.dim() != 3 or storm.size(-1) != 3:
+        raise ValueError(f"{path}: storm_boundary must be (24,N,3), got {tuple(storm.shape)}")
+    if inner.dim() != 3 or inner.size(0) != storm.size(0) or inner.size(1) != storm.size(1) or inner.size(-1) != 2:
         raise ValueError(
-            f"{path}: storm_boundary {tuple(storm.shape)} != graph {tuple(graph.shape)}"
+            f"{path}: inner_boundary {tuple(inner.shape)} incompatible with storm_boundary "
+            f"{tuple(storm.shape)} (expected (24,N,2))"
         )
-    if (
-        inner.dim() != 3
-        or inner.size(0) != graph.size(0)
-        or inner.size(1) != graph.size(1)
-        or inner.size(-1) != 2
-    ):
+    if target.dim() != 2 or target.size(-1) != 3 or target.size(0) != storm.size(1):
         raise ValueError(
-            f"{path}: inner_boundary {tuple(inner.shape)} incompatible with graph "
-            f"{tuple(graph.shape)} (expected (T,N,2))"
+            f"{path}: target {tuple(target.shape)} must be (N,3) with N={storm.size(1)}"
         )
 
-    return {"graph": graph, "storm": storm, "inner": inner}
+    return {"storm": storm, "inner": inner, "target": target}
 
 
 def build_features(
@@ -112,55 +105,8 @@ def build_features(
     return torch.cat([storm_flat, inner_flat], dim=-1).contiguous()
 
 
-class StormSurgeDataset(Dataset):
-    """Single-file storm-surge dataset with an LRU-backed event cache."""
-
-    def __init__(self, path, lru_capacity: int = 1):
-        if lru_capacity < 1:
-            raise ValueError(f"lru_capacity must be >= 1, got {lru_capacity}")
-
-        self.path = Path(path)
-        self.lru_capacity = int(lru_capacity)
-        self._cache: OrderedDict[Path, dict[str, torch.Tensor]] = OrderedDict()
-
-        entry = self._get_entry()
-        self.T = entry["graph"].size(0)
-        self.N = entry["graph"].size(1)
-        if self.T < INPUT_WINDOW + 1:
-            raise ValueError(
-                f"{self.path}: T={self.T} < {INPUT_WINDOW + 1} "
-                f"(need at least {INPUT_WINDOW + 1} timesteps)"
-            )
-        self._num_samples = self.T - INPUT_WINDOW
-
-    def __len__(self) -> int:
-        return self._num_samples
-
-    def _get_entry(self) -> dict[str, torch.Tensor]:
-        if self.path in self._cache:
-            self._cache.move_to_end(self.path)
-            return self._cache[self.path]
-        entry = load_pt(self.path)
-        self._cache[self.path] = entry
-        while len(self._cache) > self.lru_capacity:
-            self._cache.popitem(last=False)
-        return entry
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if idx < 0 or idx >= self._num_samples:
-            raise IndexError(idx)
-
-        entry = self._get_entry()
-        graph = entry["graph"]
-        storm_window = entry["storm"][idx : idx + INPUT_WINDOW]
-        inner_window = entry["inner"][idx : idx + INPUT_WINDOW]
-        target = graph[idx + INPUT_WINDOW, :, 2:3].contiguous()
-        features = build_features(storm_window, inner_window)
-        return features, target
-
-
 class MultiStormSurgeDataset(Dataset):
-    """Lazy aggregation over all usable files in one split directory."""
+    """Dataset over pre-processed .pt files — each file is one sample."""
 
     def __init__(self, data_dir, lru_files_per_worker: int = 2):
         if lru_files_per_worker < 1:
@@ -178,14 +124,13 @@ class MultiStormSurgeDataset(Dataset):
         manifest = json.loads(manifest_path.read_text())
         if "num_nodes" not in manifest or "files" not in manifest:
             raise KeyError(f"{manifest_path}: manifest must contain 'num_nodes' and 'files'")
+        if not manifest["files"]:
+            raise RuntimeError(f"{manifest_path}: manifest files list is empty")
 
         self.num_nodes = int(manifest["num_nodes"])
         self.files: list[Path] = []
-        self.file_T: list[int] = []
-        dropped = 0
-        min_T = INPUT_WINDOW + 1
-        for file_entry in manifest["files"]:
-            rel_path = file_entry["path"]
+        for entry in manifest["files"]:
+            rel_path = entry if isinstance(entry, str) else entry["path"]
             path = Path(rel_path)
             if not path.is_absolute():
                 path = self.data_dir / path
@@ -194,32 +139,12 @@ class MultiStormSurgeDataset(Dataset):
                     f"manifest references missing file {path}; rebuild manifest "
                     f"with: python scripts/build_manifest.py {self.data_dir}"
                 )
-            T = int(file_entry["T"])
-            if T < min_T:
-                dropped += 1
-                continue
             self.files.append(path)
-            self.file_T.append(T)
-
-        if dropped:
-            print(
-                f"[dataset] {self.data_dir.name}: dropped {dropped} files with "
-                f"T < {min_T}"
-            )
-        if not self.files:
-            raise RuntimeError(
-                f"{self.data_dir}: no files survive T >= {min_T} filter"
-            )
-
-        self.flat_index: list[tuple[int, int]] = []
-        for file_idx, T in enumerate(self.file_T):
-            for t in range(T - INPUT_WINDOW):
-                self.flat_index.append((file_idx, t))
 
         self._cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
 
     def __len__(self) -> int:
-        return len(self.flat_index)
+        return len(self.files)
 
     def _get_entry(self, file_idx: int) -> dict[str, torch.Tensor]:
         if file_idx in self._cache:
@@ -227,14 +152,9 @@ class MultiStormSurgeDataset(Dataset):
             return self._cache[file_idx]
 
         entry = load_pt(self.files[file_idx])
-        if entry["graph"].size(0) != self.file_T[file_idx]:
+        if entry["storm"].size(1) != self.num_nodes:
             raise ValueError(
-                f"{self.files[file_idx]}: manifest T={self.file_T[file_idx]} "
-                f"!= file T={entry['graph'].size(0)}"
-            )
-        if entry["graph"].size(1) != self.num_nodes:
-            raise ValueError(
-                f"{self.files[file_idx]}: file N={entry['graph'].size(1)} "
+                f"{self.files[file_idx]}: file N={entry['storm'].size(1)} "
                 f"!= manifest num_nodes={self.num_nodes}"
             )
 
@@ -244,21 +164,17 @@ class MultiStormSurgeDataset(Dataset):
         return entry
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if idx < 0 or idx >= len(self.flat_index):
+        if idx < 0 or idx >= len(self.files):
             raise IndexError(idx)
 
-        file_idx, t = self.flat_index[idx]
-        entry = self._get_entry(file_idx)
-        graph = entry["graph"]
-        storm_window = entry["storm"][t : t + INPUT_WINDOW]
-        inner_window = entry["inner"][t : t + INPUT_WINDOW]
-        target = graph[t + INPUT_WINDOW, :, 2:3].contiguous()
-        features = build_features(storm_window, inner_window)
-        return features, target
+        entry = self._get_entry(idx)
+        features = build_features(entry["storm"], entry["inner"])
+        target_h = entry["target"][:, 2:3].contiguous()  # (N, 1) — h only
+        return features, target_h
 
 
 class FileChunkedDistributedSampler(Sampler[int]):
-    """Distributed sampler that assigns whole files to ranks and keeps locality."""
+    """Distributed sampler that greedily assigns files to balance per-rank sample counts."""
 
     def __init__(
         self,
@@ -288,11 +204,6 @@ class FileChunkedDistributedSampler(Sampler[int]):
         self.pad_to_equal_length = bool(pad_to_equal_length)
         self.epoch = 0
 
-        self._by_file: dict[int, list[int]] = {}
-        for flat_idx, (file_idx, _) in enumerate(dataset.flat_index):
-            self._by_file.setdefault(file_idx, []).append(flat_idx)
-
-        self._all_files = sorted(self._by_file)
         self._files_by_rank, self._rank_totals = self._build_fixed_assignment()
         self._assignment_error: str | None = None
         needs_equal_nonempty = self.drop_last or self.pad_to_equal_length
@@ -300,7 +211,7 @@ class FileChunkedDistributedSampler(Sampler[int]):
             self._assignment_error = (
                 "FileChunkedDistributedSampler could not assign samples to every rank: "
                 f"rank_totals={self._rank_totals}, num_replicas={self.num_replicas}, "
-                f"num_files={len(self._all_files)}. Reduce num_replicas or add more usable files."
+                f"num_files={len(dataset)}. Reduce num_replicas or add more files."
             )
         if self.drop_last:
             self._target_count = min(self._rank_totals)
@@ -312,15 +223,10 @@ class FileChunkedDistributedSampler(Sampler[int]):
     def _build_fixed_assignment(self) -> tuple[list[list[int]], list[int]]:
         files_by_rank: list[list[int]] = [[] for _ in range(self.num_replicas)]
         totals = [0 for _ in range(self.num_replicas)]
-        files = sorted(
-            self._all_files,
-            key=lambda file_idx: (-len(self._by_file[file_idx]), file_idx),
-        )
-        for file_idx in files:
+        for file_idx in range(len(self.dataset)):
             target_rank = min(range(self.num_replicas), key=lambda rank: (totals[rank], rank))
             files_by_rank[target_rank].append(file_idx)
-            totals[target_rank] += len(self._by_file[file_idx])
-
+            totals[target_rank] += 1
         return files_by_rank, totals
 
     def __iter__(self) -> Iterator[int]:
@@ -335,14 +241,7 @@ class FileChunkedDistributedSampler(Sampler[int]):
             order = torch.randperm(len(files), generator=generator).tolist()
             files = [files[i] for i in order]
 
-        indices: list[int] = []
-        for file_idx in files:
-            samples = list(self._by_file[file_idx])
-            if self.shuffle and len(samples) > 1:
-                order = torch.randperm(len(samples), generator=generator).tolist()
-                samples = [samples[i] for i in order]
-            indices.extend(samples)
-
+        indices = list(files)
         target_count = self._target_count
         if len(indices) >= target_count:
             indices = indices[:target_count]

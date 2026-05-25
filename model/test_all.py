@@ -1,8 +1,12 @@
 """Single-step direct prediction test for Geo-FNO warm-up model (h-only).
 
-For each .pt file in the test split, iterates over all valid start positions,
-uses the 24-hour forcing window to predict h at t+24, and compares against
-ground truth.
+Each .pt file is one pre-processed sample:
+    storm_boundary  — (24, N, 3)
+    inner_boundary  — (24, N, 2)
+    target          — (N, 3)   [u, v, h] at t+24
+
+The script loads each file, builds the 120-channel feature from the 24h forcing
+window, predicts h at t+24, and compares against the ground-truth target.
 """
 from __future__ import annotations
 
@@ -14,14 +18,13 @@ import scipy.io
 import torch
 from tqdm import tqdm
 
-from dataset import build_features, load_pt
+from dataset import build_features, load_pt, load_static_coords
 from main import set_seed
 from model import GeoFNO2d
 from temporal_utils import (
     CHANNEL_NAME,
     C_IN,
     C_OUT,
-    INPUT_WINDOW,
     build_checkpoint_name,
 )
 
@@ -169,31 +172,6 @@ def find_test_files(test_dir):
     return sorted(path for path in Path(test_dir).glob("*.pt") if not path.name.startswith("._"))
 
 
-def prescan_files(file_paths):
-    """Scan each .pt to read graph T; return evaluable files.
-
-    Returns:
-        evaluable: list of (path, T, num_samples) for files with T >= 25
-        skipped: list of (path, T) for files too short
-        total_samples: total number of (input, target) pairs across evaluable files
-    """
-    min_T = INPUT_WINDOW + 1
-    evaluable = []
-    skipped = []
-    for path in tqdm(file_paths, desc="Pre-scan T"):
-        data = torch.load(path, map_location="cpu", weights_only=False)
-        if "graph" not in data:
-            raise KeyError(f"{path}: missing 'graph' key; got {list(data.keys())}")
-        num_time = int(data["graph"].shape[0])
-        del data
-        if num_time < min_T:
-            skipped.append((path, num_time))
-            continue
-        evaluable.append((path, num_time, num_time - INPUT_WINDOW))
-    total_samples = sum(samples for _, _, samples in evaluable)
-    return evaluable, skipped, total_samples
-
-
 def evaluate_one_file(
     model,
     file_path,
@@ -203,63 +181,52 @@ def evaluate_one_file(
     mean_full,
     std_full,
     device,
-    num_samples,
 ):
-    """Evaluate all valid single-step predictions for one .pt file."""
-    graph_all, storm_all, inner_all = load_pt(file_path)
-    num_time = graph_all.size(0)
-    if num_samples > num_time - INPUT_WINDOW:
-        raise ValueError(
-            f"{file_path}: num_samples={num_samples} exceeds T-{INPUT_WINDOW}={num_time - INPUT_WINDOW}"
-        )
+    """Evaluate one pre-processed .pt file (one sample)."""
+    entry = load_pt(file_path)
+    storm = entry["storm"].to(device)
+    inner = entry["inner"].to(device)
+    target_full_norm = entry["target"].unsqueeze(0).to(device)  # (1, N, 3)
 
     x_in = coords_2d_device.unsqueeze(0)  # (1, N, 2)
+    features = build_features(storm, inner).unsqueeze(0)  # (1, N, 120)
+    target_norm_sub = target_full_norm[..., 2:3]  # (1, N, 1)
 
-    results = []
     with torch.no_grad():
-        for t in range(num_samples):
-            storm_window = storm_all[t : t + INPUT_WINDOW].unsqueeze(0).to(device)
-            inner_window = inner_all[t : t + INPUT_WINDOW].unsqueeze(0).to(device)
-            features = build_features(storm_window[0], inner_window[0]).unsqueeze(0)
-            target_full_norm = graph_all[t + INPUT_WINDOW : t + INPUT_WINDOW + 1].to(device)
-            target_norm_sub = target_full_norm[..., 2:3]
+        pred_norm = model(features, x_in)
 
-            pred_norm = model(features, x_in)
+    step_result = {}
+    for metric_space in METRIC_SPACES:
+        if metric_space == "physical":
+            pred_metric = denormalize(pred_norm, mean_sub, std_sub)
+            target_metric = denormalize(target_norm_sub, mean_sub, std_sub)
+        else:
+            pred_metric = pred_norm
+            target_metric = target_norm_sub
 
-            step_result = {}
-            for metric_space in METRIC_SPACES:
-                if metric_space == "physical":
-                    pred_metric = denormalize(pred_norm, mean_sub, std_sub)
-                    target_metric = denormalize(target_norm_sub, mean_sub, std_sub)
-                else:
-                    pred_metric = pred_norm
-                    target_metric = target_norm_sub
+        diff = pred_metric - target_metric
+        diff = apply_dry_grid_error_mask(diff, target_full_norm, mean_full, std_full)
 
-                diff = pred_metric - target_metric
-                diff = apply_dry_grid_error_mask(diff, target_full_norm, mean_full, std_full)
+        sse = (diff ** 2).sum().item()
+        sae = diff.abs().sum().item()
+        sum_gt = target_metric.sum().item()
+        sum_sq_gt = (target_metric ** 2).sum().item()
 
-                sse = (diff ** 2).sum().item()
-                sae = diff.abs().sum().item()
-                sum_gt = target_metric.sum().item()
-                sum_sq_gt = (target_metric ** 2).sum().item()
+        l2_err = torch.norm(diff.reshape(1, -1), p=2, dim=1).item()
+        l2_gt = max(torch.norm(target_metric.reshape(1, -1), p=2, dim=1).item(), 1e-8)
+        rel_l2 = l2_err / l2_gt
 
-                l2_err = torch.norm(diff.reshape(1, -1), p=2, dim=1).item()
-                l2_gt = max(torch.norm(target_metric.reshape(1, -1), p=2, dim=1).item(), 1e-8)
-                rel_l2 = l2_err / l2_gt
+        step_result[metric_space] = {
+            "sse": sse, "sae": sae,
+            "sum_gt": sum_gt, "sum_sq_gt": sum_sq_gt,
+            "rel_l2": rel_l2,
+        }
 
-                step_result[metric_space] = {
-                    "sse": sse, "sae": sae,
-                    "sum_gt": sum_gt, "sum_sq_gt": sum_sq_gt,
-                    "rel_l2": rel_l2,
-                }
-
-            results.append({"step": t + 1, "metrics": step_result})
-
-    return results
+    return [{"step": 1, "metrics": step_result}]
 
 
 def compute_aggregate_stats(all_results, num_nodes):
-    """Aggregate per-step metrics across all files."""
+    """Aggregate per-file metrics."""
     by_space = {ms: {"sse": 0.0, "sae": 0.0, "sum_gt": 0.0, "sum_sq_gt": 0.0, "rel_l2_sum": 0.0, "count": 0}
                 for ms in METRIC_SPACES}
 
@@ -379,24 +346,14 @@ def main():
     if not test_files:
         raise FileNotFoundError(f"No .pt files in {args.test_dir}")
 
-    evaluable, skipped, total_samples = prescan_files(test_files)
-    print(
-        f"[test] prescan: total={len(test_files)} "
-        f"evaluable={len(evaluable)} skipped={len(skipped)} "
-        f"total_samples={total_samples}"
-    )
-    if not evaluable:
-        raise RuntimeError(
-            f"No files eligible for evaluation. total={len(test_files)}, "
-            f"skipped={len(skipped)}, need T >= {INPUT_WINDOW + 1}"
-        )
+    print(f"[test] evaluating {len(test_files)} files")
 
     all_results = []
-    for path, _T, num_samples in tqdm(evaluable, desc="Test files"):
+    for path in tqdm(test_files, desc="Test files"):
         file_results = evaluate_one_file(
             model, path, coords_2d_device,
             mean_sub, std_sub, mean_full, std_full,
-            device, num_samples,
+            device,
         )
         all_results.append(file_results)
 
@@ -414,8 +371,8 @@ def main():
         stats, args.output,
         model_path,
         total_files=len(test_files),
-        evaluated_files=len(evaluable),
-        skipped_files=len(skipped),
+        evaluated_files=len(test_files),
+        skipped_files=0,
     )
     print("[test] done.")
 
